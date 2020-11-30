@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/cgroups"
 	statsV1 "github.com/containerd/cgroups/stats/v1"
 	statsV2 "github.com/containerd/cgroups/v2/stats"
 	"github.com/containerd/containerd/sys"
@@ -43,7 +44,6 @@ import (
 	"github.com/docker/libnetwork/options"
 	lntypes "github.com/docker/libnetwork/types"
 	"github.com/moby/sys/mount"
-	"github.com/opencontainers/runc/libcontainer/cgroups"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
@@ -187,7 +187,7 @@ func getBlkioWeightDevices(config containertypes.Resources) ([]specs.LinuxWeight
 
 	for _, weightDevice := range config.BlkioWeightDevice {
 		if err := unix.Stat(weightDevice.Path, &stat); err != nil {
-			return nil, err
+			return nil, errors.WithStack(&os.PathError{Op: "stat", Path: weightDevice.Path, Err: err})
 		}
 		weight := weightDevice.Weight
 		d := specs.LinuxWeightDevice{Weight: &weight}
@@ -260,7 +260,7 @@ func getBlkioThrottleDevices(devs []*blkiodev.ThrottleDevice) ([]specs.LinuxThro
 
 	for _, d := range devs {
 		if err := unix.Stat(d.Path, &stat); err != nil {
-			return nil, err
+			return nil, errors.WithStack(&os.PathError{Op: "stat", Path: d.Path, Err: err})
 		}
 		d := specs.LinuxThrottleDevice{Rate: d.Rate}
 		// the type is 32bit on mips
@@ -362,11 +362,11 @@ func (daemon *Daemon) adaptContainerSettings(hostConfig *containertypes.HostConf
 	if hostConfig.CgroupnsMode.IsEmpty() {
 		// for cgroup v2: unshare cgroupns even for privileged containers
 		// https://github.com/containers/libpod/pull/4374#issuecomment-549776387
-		if hostConfig.Privileged && !cgroups.IsCgroup2UnifiedMode() {
+		if hostConfig.Privileged && cgroups.Mode() != cgroups.Unified {
 			hostConfig.CgroupnsMode = containertypes.CgroupnsMode("host")
 		} else {
 			m := "host"
-			if cgroups.IsCgroup2UnifiedMode() {
+			if cgroups.Mode() == cgroups.Unified {
 				m = "private"
 			}
 			if daemon.configStore != nil {
@@ -637,7 +637,7 @@ func UsingSystemd(config *config.Config) bool {
 		return true
 	}
 	// On cgroup v2 hosts, default to systemd driver
-	if getCD(config) == "" && cgroups.IsCgroup2UnifiedMode() && IsRunningSystemd() {
+	if getCD(config) == "" && cgroups.Mode() == cgroups.Unified && IsRunningSystemd() {
 		return true
 	}
 	return false
@@ -758,7 +758,7 @@ func verifyDaemonSettings(conf *config.Config) error {
 		}
 	}
 
-	if conf.Rootless && UsingSystemd(conf) && !cgroups.IsCgroup2UnifiedMode() {
+	if conf.Rootless && UsingSystemd(conf) && cgroups.Mode() != cgroups.Unified {
 		return fmt.Errorf("exec-opt native.cgroupdriver=systemd requires cgroup v2 for rootless mode")
 	}
 
@@ -1566,11 +1566,15 @@ func (daemon *Daemon) statsV2(s *types.StatsJSON, stats *statsV2.Metrics) (*type
 			Usage: stats.Memory.Usage,
 			// MaxUsage is not supported
 			Limit: stats.Memory.UsageLimit,
-			// TODO: Failcnt
 		}
 		// if the container does not set memory limit, use the machineMemory
 		if s.MemoryStats.Limit > daemon.machineMemory && daemon.machineMemory > 0 {
 			s.MemoryStats.Limit = daemon.machineMemory
+		}
+		if stats.MemoryEvents != nil {
+			// Failcnt is set to the "oom" field of the "memory.events" file.
+			// See https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
+			s.MemoryStats.Failcnt = stats.MemoryEvents.Oom
 		}
 	}
 
@@ -1632,6 +1636,9 @@ func setMayDetachMounts() error {
 }
 
 func setupOOMScoreAdj(score int) error {
+	if score == 0 {
+		return nil
+	}
 	f, err := os.OpenFile("/proc/self/oom_score_adj", os.O_WRONLY, 0)
 	if err != nil {
 		return err
@@ -1703,4 +1710,8 @@ func (daemon *Daemon) RawSysInfo(quiet bool) *sysinfo.SysInfo {
 		}
 	}
 	return sysinfo.New(quiet, opts...)
+}
+
+func recursiveUnmount(target string) error {
+	return mount.RecursiveUnmount(target)
 }
